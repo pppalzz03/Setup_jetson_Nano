@@ -21,34 +21,19 @@ Every step shows progress in %, a DONE / SKIP / WARN / FAIL checklist, and remem
 └── .shellcheckrc
 ```
 
-## 1. Prepare the repo (on your Mac, once)
 
-```bash
-cd ~/Documents/Setup_jetson_Nano
-brew install git-lfs && git lfs install
-git init -b main
-# copy the extracted package into driver/ (folder name must match):
-#   driver/SG4A_NONX_G2Y_A1_ORIN_NANO_YUV_JP6.2_L4TR36.4.3/
-git add .gitattributes && git add .
-git update-index --chmod=+x setup.sh scripts/*.sh
-git lfs ls-files            # should list Image, *.ko, *.dtbo ... (not the .sh files)
-git commit -m "SG4A camera setup scripts + driver package"
-git remote add origin git@github.com:<you>/<repo>.git    # use a PRIVATE repo
-git push -u origin main
-```
-
-## 2. Get it on the Jetson
+## 1. Get it on the Jetson
 
 ```bash
 sudo apt install -y git git-lfs v4l-utils
 git lfs install
-git clone https://github.com/<you>/<repo>.git ~/sg4a && cd ~/sg4a
+git clone https://github.com/pppalzz03/Setup_jetson_Nano.git ~/sg4a && cd ~/sg4a
 ./setup.sh status
 ```
 
 Update later with `git pull` (LFS files come with it). Run as your normal user, without `sudo` — the scripts call `sudo` only where needed.
 
-## 3. Run
+## 2. Run
 
 ```bash
 ./setup.sh            # step 1 -> asks to reboot
