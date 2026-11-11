@@ -1,0 +1,15 @@
+# test outputs (step3 check-frame / live)
+*.uyvy
+*.jpg
+*.log
+# local state is kept in ~/.local/state/sg4a, never in the repo
+.state/
+# OS / editor junk
+.DS_Store
+._*
+*.swp
+*~
+# downloaded archives you extracted into driver/ (keep the extracted folder only)
+driver/*.zip
+driver/*.tar.gz
+driver/*.tgz
