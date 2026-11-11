@@ -9,8 +9,8 @@
 # --- Git LFS: binaries of the SENSING driver package (kernel Image, modules, device tree, archives)
 driver/**           filter=lfs diff=lfs merge=lfs -text
 # ...but keep the package's scripts and docs as normal text files (readable diffs, LF endings)
-driver/**/*.sh      -filter -diff -merge text eol=lf
-driver/**/*.md      -filter -diff -merge text eol=lf
-driver/**/*.txt     -filter -diff -merge text eol=lf
-driver/README.md    -filter -diff -merge text eol=lf
-driver/.gitkeep     -filter -diff -merge text
+driver/**/*.sh      !filter !diff !merge text eol=lf
+driver/**/*.md      !filter !diff !merge text eol=lf
+driver/**/*.txt     !filter !diff !merge text eol=lf
+driver/README.md    !filter !diff !merge text eol=lf
+driver/.gitkeep     !filter !diff !merge text
