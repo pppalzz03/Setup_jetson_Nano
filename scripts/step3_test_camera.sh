@@ -6,7 +6,7 @@
 #   all          (default) formats + test + check-frame
 #   formats      list resolutions announced by the driver (v4l2-ctl --list-formats-ext);
 #                warns if 1600x1300 is missing while --camera DMSBBFAN is set
-#   test         capture with v4l2-ctl --stream-mmap (timeout 15) on every port,
+#   test         capture with v4l2-ctl --stream-mmap (timeout 15 by default) on every port,
 #                report fps and check dmesg for uncorr_err
 #   check-frame  grab one frame, compute Y/UV min/max/unique with python3,
 #                tell blank vs. real image, save /tmp/camN.jpg (copy with scp)
@@ -33,6 +33,9 @@ DISPLAY_OPT=""
 XAUTH_OPT=""
 LIVE_SIZE=""
 DETACH=0
+TIMEOUT=15
+RETRIES=1
+SETTLE=2
 
 usage() {
   cat <<EOF
@@ -46,6 +49,9 @@ Options:
   --camera NAME      camera model, e.g. DMSBBFAN (or env SG4A_CAMERA); used for the resolution warning
   --count N          frames for 'test' (default: ${COUNT})
   --min-fps F        minimum fps to pass (default: ${MIN_FPS})
+  --timeout SEC      per-capture timeout in test / check-frame (default: ${TIMEOUT})
+  --retries N        extra attempts after a timeout, 2 s apart (default: ${RETRIES}); a pass on retry is reported as WARN
+  --settle SEC       pause between ports in test (default: ${SETTLE})
   --fps N            framerate in live caps (default: ${FPS})
   --outdir DIR       where check-frame writes camN.uyvy / camN.jpg (default: ${OUTDIR})
   --display :N       X display to use (default: auto-detect)
@@ -68,6 +74,9 @@ while [ $# -gt 0 ]; do
     --camera=*)  CAMERA="${1#*=}"; shift ;;
     --count)     [ $# -ge 2 ] || bad_arg "$1"; COUNT="$2"; shift 2 ;;
     --min-fps)   [ $# -ge 2 ] || bad_arg "$1"; MIN_FPS="$2"; shift 2 ;;
+    --timeout)   [ $# -ge 2 ] || bad_arg "$1"; TIMEOUT="$2"; shift 2 ;;
+    --retries)   [ $# -ge 2 ] || bad_arg "$1"; RETRIES="$2"; shift 2 ;;
+    --settle)    [ $# -ge 2 ] || bad_arg "$1"; SETTLE="$2"; shift 2 ;;
     --fps)       [ $# -ge 2 ] || bad_arg "$1"; FPS="$2"; shift 2 ;;
     --outdir)    [ $# -ge 2 ] || bad_arg "$1"; OUTDIR="$2"; shift 2 ;;
     --display)   [ $# -ge 2 ] || bad_arg "$1"; DISPLAY_OPT="$2"; shift 2 ;;
@@ -84,6 +93,9 @@ done
 { [[ "$COUNT" =~ ^[0-9]+$ ]] && [ "$COUNT" -gt 0 ]; } || bad_arg "--count $COUNT"
 [[ "$MIN_FPS" =~ ^[0-9]+(\.[0-9]+)?$ ]] || bad_arg "--min-fps $MIN_FPS"
 [[ "$FPS" =~ ^[0-9]+$ ]] || bad_arg "--fps $FPS"
+{ [[ "$TIMEOUT" =~ ^[0-9]+$ ]] && [ "$TIMEOUT" -gt 0 ]; } || bad_arg "--timeout $TIMEOUT"
+[[ "$RETRIES" =~ ^[0-9]+$ ]] || bad_arg "--retries $RETRIES"
+[[ "$SETTLE" =~ ^[0-9]+$ ]] || bad_arg "--settle $SETTLE"
 [ -z "$LIVE_SIZE" ] || [[ "$LIVE_SIZE" =~ ^[0-9]+x[0-9]+$ ]] || bad_arg "--live-size $LIVE_SIZE (e.g. 960x768)"
 [ -z "$DISPLAY_OPT" ] || [[ "$DISPLAY_OPT" =~ ^:[0-9]+(\.[0-9]+)?$ ]] || bad_arg "--display $DISPLAY_OPT (e.g. :1)"
 
@@ -150,44 +162,80 @@ do_formats() {
 }
 
 # =============================================================================
+# one capture attempt on DEV; sets A_RC A_FPS A_FRAMES A_REASON A_NEWERR A_OUT
+A_RC=0; A_FPS=""; A_FRAMES=0; A_REASON=""; A_NEWERR=0; A_OUT=""
+capture_attempt() {
+  local dev="$1" base after
+  base="$(uncorr_count)"
+  A_OUT="$(timeout "$TIMEOUT" v4l2-ctl -d "$dev" --set-fmt-video="width=${W},height=${H},pixelformat=UYVY" \
+            --stream-mmap --stream-count="$COUNT" 2>&1)"; A_RC=$?
+  after="$(uncorr_count)"; A_NEWERR=$((after - base))
+  A_FPS="$(printf '%s' "$A_OUT" | tr '\r' '\n' | grep -oE '[0-9]+(\.[0-9]+)? fps' | tail -n1 | awk '{print $1}')"
+  A_FRAMES="$(printf '%s' "$A_OUT" | tr -cd '<' | wc -c)"
+  A_REASON=""
+  [ "$A_RC" -eq 124 ] && A_REASON="timed out after ${TIMEOUT} s (${A_FRAMES}/${COUNT} frames received)"
+  [ -z "$A_REASON" ] && [ "$A_RC" -ne 0 ] && A_REASON="v4l2-ctl exited with ${A_RC}: $(printf '%s' "$A_OUT" | grep -iE 'error|busy|fail' | head -n1)"
+  [ -z "$A_REASON" ] && [ "$A_FRAMES" -lt "$COUNT" ] && A_REASON="got ${A_FRAMES}/${COUNT} frames"
+  [ -z "$A_REASON" ] && [ -n "$A_FPS" ] && awk -v a="$A_FPS" -v b="$MIN_FPS" 'BEGIN{exit !(a<b)}' && A_REASON="fps ${A_FPS} below ${MIN_FPS}"
+  [ -z "$A_REASON" ] && [ "$A_NEWERR" -gt 0 ] && A_REASON="${A_NEWERR} new uncorr_err line(s) in dmesg"
+  [ -z "$A_REASON" ]
+}
+show_kernel_hints() {   # recent camera-related kernel messages, to diagnose a failed capture
+  local lines
+  lines="$(dmesg_all | tail -n 80 | grep -iE 'uncorr|timed out|timeout|csi|camrtc|capture|vi[0-9 ]|sgx|max96712|der-?[0-9]|i2c-w' | tail -n 12)"
+  if [ -n "$lines" ]; then info "Recent kernel messages:"; printf '%s\n' "$lines" | sed 's/^/           /'
+  else info "No related kernel messages (no uncorr_err): the stream started but no frame arrived"; fi
+}
 do_test() {
-  info "${COUNT} frames per port, timeout 15 s, pass if fps >= ${MIN_FPS} and no new uncorr_err"
-  local p dev out rc fps frames base after reason n_pass=0 n_fail=0 results=()
+  info "${COUNT} frames per port, timeout ${TIMEOUT} s, pass if fps >= ${MIN_FPS} and no new uncorr_err (${RETRIES} retry after a timeout)"
+  local p dev attempt n_pass=0 n_fail=0 n_retry=0 results=() first=1
   for p in $PORTS; do
     dev="/dev/video${p}"
     need_dev "$dev" || { n_fail=$((n_fail + 1)); continue; }
     resolve_res "$dev" || { n_fail=$((n_fail + 1)); continue; }
     if [ "$DRY_RUN" -eq 1 ]; then
-      run timeout 15 v4l2-ctl -d "$dev" --set-fmt-video="width=${W},height=${H},pixelformat=UYVY" --stream-mmap --stream-count="$COUNT"
+      run timeout "$TIMEOUT" v4l2-ctl -d "$dev" --set-fmt-video="width=${W},height=${H},pixelformat=UYVY" --stream-mmap --stream-count="$COUNT"
       continue
     fi
+    # let the previous camera's stream shut down completely before the next one starts
+    if [ "$first" -eq 0 ] && [ "$SETTLE" -gt 0 ]; then info "(pausing ${SETTLE} s between cameras)"; sleep "$SETTLE"; fi
+    first=0
     info "--- ${dev} (${W}x${H} UYVY)"
-    base="$(uncorr_count)"
-    out="$(timeout 15 v4l2-ctl -d "$dev" --set-fmt-video="width=${W},height=${H},pixelformat=UYVY" \
-            --stream-mmap --stream-count="$COUNT" 2>&1)"; rc=$?
-    after="$(uncorr_count)"
-    fps="$(printf '%s' "$out" | tr '\r' '\n' | grep -oE '[0-9]+(\.[0-9]+)? fps' | tail -n1 | awk '{print $1}')"
-    frames="$(printf '%s' "$out" | tr -cd '<' | wc -c)"
-    reason=""
-    [ "$rc" -eq 124 ] && reason="timed out after 15 s (not all frames received)"
-    [ -z "$reason" ] && [ "$rc" -ne 0 ] && reason="v4l2-ctl exited with ${rc}: $(printf '%s' "$out" | grep -iE 'error|busy|fail' | head -n1)"
-    [ -z "$reason" ] && [ "$frames" -lt "$COUNT" ] && reason="got ${frames}/${COUNT} frames"
-    [ -z "$reason" ] && [ -n "$fps" ] && awk -v a="$fps" -v b="$MIN_FPS" 'BEGIN{exit !(a<b)}' && reason="fps ${fps} below ${MIN_FPS}"
-    [ -z "$reason" ] && [ "$after" -gt "$base" ] && reason="$((after - base)) new uncorr_err line(s) in dmesg"
-    if [ -z "$reason" ]; then
-      ok "${dev}: ${frames} frames, ${fps:-?} fps, no uncorr_err"; n_pass=$((n_pass + 1)); results+=("video${p}=${fps:-?}fps")
+    attempt=0
+    while :; do
+      capture_attempt "$dev" && break
+      [ "$A_RC" -eq 124 ] && [ "$attempt" -lt "$RETRIES" ] || break
+      attempt=$((attempt + 1))
+      warn "${dev}: ${A_REASON} - retrying in 2 s (attempt $((attempt + 1))/$((RETRIES + 1)))"
+      sleep 2
+    done
+    if [ -z "$A_REASON" ] && [ "$attempt" -eq 0 ]; then
+      ok "${dev}: ${A_FRAMES} frames, ${A_FPS:-?} fps, no uncorr_err"; n_pass=$((n_pass + 1)); results+=("video${p}=${A_FPS:-?}fps")
+    elif [ -z "$A_REASON" ]; then
+      warn "${dev}: ${A_FRAMES} frames, ${A_FPS:-?} fps - but only on attempt $((attempt + 1)); the first start timed out"
+      info "A stream start right after another camera was used can time out (cause not yet known)."
+      n_pass=$((n_pass + 1)); n_retry=$((n_retry + 1)); results+=("video${p}=${A_FPS:-?}fps(retry)")
     else
-      fail "${dev}: ${reason}"; n_fail=$((n_fail + 1)); results+=("video${p}=FAIL")
-      if [ "$after" -gt "$base" ] || [ "$rc" -eq 124 ]; then
-        info "uncorr_err / timeout usually means a skipped step: GMSLMODE, clock_config.sh or sensor_mode"
+      fail "${dev}: ${A_REASON}"; n_fail=$((n_fail + 1)); results+=("video${p}=FAIL")
+      show_kernel_hints
+      if [ "$A_NEWERR" -gt 0 ]; then
+        info "uncorr_err usually means a skipped step: GMSLMODE, clock_config.sh or sensor_mode"
         info "Fix: ./setup.sh step2 --force-reload, then test again"
+      elif [ "$A_RC" -eq 124 ]; then
+        info "Timeout without uncorr_err: this camera may not be streaming. Narrow it down:"
+        info "  ./setup.sh test --ports ${p}      (this camera alone)"
+        info "  ./setup.sh test --ports ${p},$(tr ' ' '\n' <<<"$PORTS" | grep -vx "$p" | head -n1)   (this camera first)"
+        info "Also check power/PoC and the coax cable of this camera"
       fi
-      printf '%s\n' "$out" | grep -qi 'busy' && info "Device busy: stop the live view first (./setup.sh stop)"
+      printf '%s\n' "$A_OUT" | grep -qi 'busy' && info "Device busy: stop the live view first (./setup.sh stop)"
     fi
   done
   [ "$DRY_RUN" -eq 1 ] && { step_done "dry run"; return 0; }
-  info "Capture test: ${n_pass} passed, ${n_fail} failed"
-  if [ "$n_fail" -eq 0 ] && [ "$n_pass" -gt 0 ]; then step_done "${results[*]}"; return 0; fi
+  info "Capture test: ${n_pass} passed (${n_retry} only after a retry), ${n_fail} failed"
+  if [ "$n_fail" -eq 0 ] && [ "$n_pass" -gt 0 ]; then
+    if [ "$n_retry" -gt 0 ]; then step_warn "${results[*]}"; else step_done "${results[*]}"; fi
+    return 0
+  fi
   die "Capture test failed (${results[*]:-no ports})" "See the messages above"
 }
 
@@ -241,7 +289,7 @@ do_check_frame() {
     need_dev "$dev" || { n_fail=$((n_fail + 1)); continue; }
     resolve_res "$dev" || { n_fail=$((n_fail + 1)); continue; }
     if [ "$DRY_RUN" -eq 1 ]; then
-      run timeout 15 v4l2-ctl -d "$dev" --set-fmt-video="width=${W},height=${H},pixelformat=UYVY" --stream-mmap --stream-skip=4 --stream-count=1 --stream-to="$raw"
+      run timeout "$TIMEOUT" v4l2-ctl -d "$dev" --set-fmt-video="width=${W},height=${H},pixelformat=UYVY" --stream-mmap --stream-skip=4 --stream-count=1 --stream-to="$raw"
       run python3 -I - "$raw" "$W" "$H"
       printf '  [dry-run] convert %s -> %s (gst rawvideoparse/jpegenc or ffmpeg)\n' "$raw" "$jpg"
       continue
@@ -249,7 +297,7 @@ do_check_frame() {
     info "--- ${dev} (${W}x${H})"
     rm -f "$raw"
     # skip 4 frames (may not be stable yet), keep 1
-    if ! timeout 15 v4l2-ctl -d "$dev" --set-fmt-video="width=${W},height=${H},pixelformat=UYVY" \
+    if ! timeout "$TIMEOUT" v4l2-ctl -d "$dev" --set-fmt-video="width=${W},height=${H},pixelformat=UYVY" \
           --stream-mmap --stream-skip=4 --stream-count=1 --stream-to="$raw" >/dev/null 2>&1; then
       fail "${dev}: frame capture failed (run './setup.sh test' for details, or './setup.sh stop' if live view is open)"
       n_fail=$((n_fail + 1)); results+=("video${p}=capture-failed"); continue
