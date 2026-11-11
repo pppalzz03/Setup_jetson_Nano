@@ -27,6 +27,7 @@ readonly KO_CAM="sgx-yuv-gmsl2.ko"
 readonly KO_DER="max96712.ko"
 
 FORCE_RELOAD=0
+RELOAD_DER=0
 GMSL="2,2,2,2"
 MODE=1
 PORTS_OPT=""
@@ -44,7 +45,8 @@ Options:
   --gmsl A,B,C,D    GMSLMODE per port: 0=GMSL, 1=GMSL2/6G, 2=GMSL2/3G (default: ${GMSL})
   --mode N          sensor_mode 0=1920x1080 1=1920x1536 2=2880x1860 3=3840x2160 4=1280x720 (default: ${MODE})
   --ports 0,3       use these ports (default: auto-detect from dmesg "been detected!")
-  --force-reload    reload the module even if GMSLMODE is already correct
+  --force-reload    reload sgx_yuv_gmsl2 even if GMSLMODE is already correct
+  --reload-der      also unload/reload max96712.ko (use if its boot-time probe failed; off by default)
   --wait SEC        max seconds to wait for camera detection after insmod (default: ${WAIT_SEC})
   --dry-run         print commands that change the system, do not run them
   -h, --help        show this help
@@ -64,6 +66,7 @@ while [ $# -gt 0 ]; do
     --ports=*)      PORTS_OPT="${1#*=}"; shift ;;
     --wait)         [ $# -ge 2 ] || bad_arg "$1"; WAIT_SEC="$2"; shift 2 ;;
     --force-reload) FORCE_RELOAD=1; shift ;;
+    --reload-der)   RELOAD_DER=1; shift ;;
     --dry-run)      DRY_RUN=1; shift ;;
     -h|--help)      usage; exit 0 ;;
     *)              bad_arg "$1" ;;
@@ -96,24 +99,60 @@ else check_fail "/dev/media0 missing - camera overlay is not active" \
 if [ -e "$I2C_NODE" ]; then ok "MAX96712 node (0x6b) on i2c-9: $I2C_NODE"
 else check_fail "$I2C_NODE missing - overlay did not create the MAX96712 node on i2c-9" \
   "Make sure the system booted LABEL JetsonIO with overlay \"Jetson Sensing YUV GMSLx4\""; fi
+# Does the MAX96712 answer on i2c-9 at 0x6b right now? (read-only i2cdetect -r)
+#   UU = a driver is bound   6b = chip answers, no driver bound   -- = no answer
+I2C_ACK="unknown"
 if command -v i2cdetect >/dev/null 2>&1; then
-  ROW60="$($SUDO i2cdetect -y -r 9 2>/dev/null | grep '^60:' || true)"   # read-only; UU = driver owns it
-  [ -n "$ROW60" ] && info "i2cdetect -y -r 9 (row 0x60): $ROW60"
+  ROW60="$($SUDO i2cdetect -y -r 9 2>/dev/null | grep '^60:' || true)"
+  if [ -n "$ROW60" ]; then
+    info "i2cdetect -y -r 9 (row 0x60): $ROW60"
+    case "$(awk '{print $13}' <<<"$ROW60")" in
+      UU) I2C_ACK="bound" ;;
+      6b) I2C_ACK="free" ;;
+      --) I2C_ACK="none" ;;
+    esac
+  fi
 fi
+case "$I2C_ACK" in
+  bound) ok "MAX96712 answers at 0x6b and a driver is bound (UU)" ;;
+  free)  ok "MAX96712 answers at 0x6b (no driver bound yet) - the hardware path on i2c-9 is alive" ;;
+  none)  warn "Nothing answers at 0x6b on i2c-9 (shows --)" ;;
+  *)     info "Could not read i2c-9 (i2cdetect missing?)" ;;
+esac
 refresh_dmesg
 LAST_ADAPT="$(printf '%s\n' "$DM" | grep -E 'i2c-w, write failed|can.t find DER adapt broad|adapt broad success' | tail -n1 || true)"
 case "$LAST_ADAPT" in
-  *"adapt broad success"*) ok "MAX96712 responds: $(printf '%s' "$LAST_ADAPT" | sed 's/^\[[^]]*\] *//')" ;;
+  *"adapt broad success"*) ok "MAX96712 init OK in dmesg: $(printf '%s' "$LAST_ADAPT" | sed 's/^\[[^]]*\] *//')" ;;
   *"write failed"*|*"adapt broad"*)
-    check_fail "dmesg shows \"i2c-w, write failed\" / \"can't find DER adapt broad\" - MAX96712 not answering on i2c-9" \
-      "MIPI cable is on the wrong connector: power off and move it to the 22-pin CAM1 connector, then boot" ;;
+    if [ "$I2C_ACK" = none ]; then
+      check_fail "MAX96712 does not answer at 0x6b on i2c-9 and dmesg shows \"i2c-w, write failed\"" \
+        "Check: MIPI cable on the 22-pin CAM1 connector, 12V power to the SG4A board, then power-cycle and boot again"
+    else
+      warn "dmesg has an OLD \"i2c-w, write failed\" / \"can't find DER adapt broad\" line, but the chip answers now"
+      info "Likely the driver probed at boot before the board was ready. Continuing: the modules are reloaded below"
+      info "and dmesg is checked again only for messages produced AFTER the reload."
+    fi ;;
   *) info "No 'adapt broad' message in dmesg yet (driver may not be loaded)" ;;
 esac
 step_done "overlay active"
 
 # =============================================================================
 step_begin 2
-if lsmod | awk '{print $1}' | grep -qx "$MOD_DER"; then
+if lsmod | awk '{print $1}' | grep -qx "$MOD_DER" && [ "$RELOAD_DER" -eq 1 ]; then
+  shopt -s nullglob; VD=(/dev/video*); shopt -u nullglob
+  if [ ${#VD[@]} -gt 0 ] && command -v fuser >/dev/null 2>&1 && $SUDO fuser -s "${VD[@]}" 2>/dev/null; then
+    fail "Programs are using /dev/video*, modules cannot be unloaded:"
+    $SUDO fuser -v "${VD[@]}" 2>&1 | sed 's/^/         /'
+    die "Not unloading while cameras are in use (rmmod -f is never used)" "Run ./setup.sh stop (or close the programs above) and try again"
+  fi
+  if lsmod | awk '{print $1}' | grep -qx "$MOD_CAM"; then
+    run $SUDO rmmod "$MOD_CAM" || die "rmmod ${MOD_CAM} failed (-f is never used)" "Close programs using the cameras, then try again"
+    ok "Unloaded ${MOD_CAM} (it depends on ${MOD_DER})"
+  fi
+  run $SUDO rmmod "$MOD_DER" || die "rmmod ${MOD_DER} failed (-f is never used)" "Check: lsmod | grep -E '${MOD_DER}|${MOD_CAM}'"
+  run $SUDO insmod "$PKG/ko/$KO_DER" || die "insmod ${KO_DER} failed" "See: sudo dmesg | tail -n 30"
+  step_done "${MOD_DER} reloaded"
+elif lsmod | awk '{print $1}' | grep -qx "$MOD_DER"; then
   step_skip "${MOD_DER} already loaded"
 else
   run $SUDO insmod "$PKG/ko/$KO_DER" || die "insmod ${KO_DER} failed" "See: sudo dmesg | tail -n 30"
@@ -199,7 +238,12 @@ elif [ "$DRY_RUN" -eq 1 ]; then
 else
   fail "No camera detected on any port"
   if [ "$N_WFAIL" -gt 0 ]; then
-    die "dmesg shows \"i2c-w, write failed\"" "The MIPI cable must be on the 22-pin CAM1 connector (power off before moving it)"
+    if [ "$I2C_ACK" = none ]; then
+      die "dmesg shows \"i2c-w, write failed\" and 0x6b does not answer" "The MIPI cable must be on the 22-pin CAM1 connector, and the board needs 12V (power off before moving the cable)"
+    else
+      die "\"i2c-w, write failed\" again after the reload, although 0x6b answers on i2c-9" \
+          "The cable connector is probably right. Try ./setup.sh step2 --reload-der; if it repeats, power-cycle the SG4A board (12V) and the cameras, then send: sudo dmesg | grep -iE 'max96712|sgx|i2c-w' | tail -n 40"
+    fi
   elif [[ "$GOT_MODE" == *0* ]]; then
     die "\"detect error\" on every port and GMSLMODE=${GOT_MODE} (0 = first-generation GMSL)" \
         "Wrong serializer type: the cameras are GMSL2. Run: ./setup.sh step2 --gmsl 2,2,2,2  (or 1 for GMSL2/6G)"
