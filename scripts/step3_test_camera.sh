@@ -33,8 +33,9 @@ DISPLAY_OPT=""
 XAUTH_OPT=""
 LIVE_SIZE=""
 DETACH=0
-SCALER="cpu"
-EXPECT=4
+SCALER="auto"
+EXPECT="${SG4A_EXPECT_CAMERAS:-0}"
+FORCE=0
 TIMEOUT=15
 RETRIES=1
 SETTLE=2
@@ -59,8 +60,10 @@ Options:
   --display :N       X display to use (default: auto-detect)
   --xauth FILE       XAUTHORITY file (default: auto-detect)
   --live-size WxH    live window size (default: half the capture size)
-  --scaler cpu|nvvidconv  live: how frames are scaled for the window (default: ${SCALER}; try nvvidconv if fps is low with 4 cameras)
-  --expect N         number of cameras you expect (default: ${EXPECT}); only used to report missing ports
+  --scaler auto|cpu|nvvidconv  live: how frames are scaled for the window (default: ${SCALER} = nvvidconv if the GStreamer element exists, else cpu).
+                     Measured here: cpu ~6 fps per camera, nvvidconv ~30 fps (needs: sudo apt install nvidia-l4t-gstreamer)
+  --expect N         number of cameras you expect (env SG4A_EXPECT_CAMERAS, default: ${EXPECT} = no check); reports missing ports
+  --force            live: start even if step 2 has not passed in this boot
   --detach           live: keep running after SSH closes (stop with: $0 stop)
   --dry-run          print commands, do not run them
 EOF
@@ -88,6 +91,7 @@ while [ $# -gt 0 ]; do
     --live-size) [ $# -ge 2 ] || bad_arg "$1"; LIVE_SIZE="$2"; shift 2 ;;
     --scaler)    [ $# -ge 2 ] || bad_arg "$1"; SCALER="$2"; shift 2 ;;
     --expect)    [ $# -ge 2 ] || bad_arg "$1"; EXPECT="$2"; shift 2 ;;
+    --force)     FORCE=1; shift ;;
     --detach)    DETACH=1; shift ;;
     --dry-run)   DRY_RUN=1; shift ;;
     -h|--help)   usage; exit 0 ;;
@@ -102,7 +106,7 @@ done
 { [[ "$TIMEOUT" =~ ^[0-9]+$ ]] && [ "$TIMEOUT" -gt 0 ]; } || bad_arg "--timeout $TIMEOUT"
 [[ "$RETRIES" =~ ^[0-9]+$ ]] || bad_arg "--retries $RETRIES"
 [[ "$SETTLE" =~ ^[0-9]+$ ]] || bad_arg "--settle $SETTLE"
-[[ "$SCALER" =~ ^(cpu|nvvidconv)$ ]] || bad_arg "--scaler $SCALER (cpu|nvvidconv)"
+[[ "$SCALER" =~ ^(auto|cpu|nvvidconv)$ ]] || bad_arg "--scaler $SCALER (auto|cpu|nvvidconv)"
 { [[ "$EXPECT" =~ ^[0-9]+$ ]] && [ "$EXPECT" -le 4 ]; } || bad_arg "--expect $EXPECT (0-4)"
 [ -z "$LIVE_SIZE" ] || [[ "$LIVE_SIZE" =~ ^[0-9]+x[0-9]+$ ]] || bad_arg "--live-size $LIVE_SIZE (e.g. 960x768)"
 [ -z "$DISPLAY_OPT" ] || [[ "$DISPLAY_OPT" =~ ^:[0-9]+(\.[0-9]+)?$ ]] || bad_arg "--display $DISPLAY_OPT (e.g. :1)"
@@ -116,10 +120,10 @@ detect_ports() {
     ok "Cameras detected (dmesg): port(s) ${PORTS}"
     local n_det missing="" q
     n_det=$(wc -w <<<"$PORTS")
-    if [ "$n_det" -lt "$EXPECT" ]; then
+    if [ "$EXPECT" -gt 0 ] && [ "$n_det" -lt "$EXPECT" ]; then
       for q in $(seq 0 $((EXPECT - 1))); do grep -qw "$q" <<<"$PORTS" || missing="${missing}${missing:+ }${q}"; done
       warn "Only ${n_det} of ${EXPECT} expected cameras detected - missing port(s): ${missing}"
-      info "Missing cameras are not tested or shown. Check their power/coax, then: ./setup.sh step2 --force-reload"
+      info "Missing cameras are not tested or shown. Check their power/coax; if all links are lost, power-cycle the board (see README)"
     fi
   elif [ "$DRY_RUN" -eq 1 ]; then
     warn "No \"been detected!\" in dmesg (dry run: assuming port 0)"; PORTS="0"
@@ -201,12 +205,21 @@ show_kernel_hints() {   # recent camera-related kernel messages, to diagnose a f
   if [ -n "$lines" ]; then info "Recent kernel messages:"; printf '%s\n' "$lines" | sed 's/^/           /'
   else info "No related kernel messages (no uncorr_err): the stream started but no frame arrived"; fi
 }
+show_link_hint() {   # link values of the last driver load, to tell "no link" from "link but no video"
+  local v; v="$(link_values_from "$(dmesg_all)")"
+  [ -n "$v" ] && info "Link values at the last driver load: ${v}   (0xc8 = linked; 0x00 = nothing linked)"
+  return 0
+}
 show_port_state() {   # controls that decide whether the sensor streams
   local dev="$1" c
   c="$(v4l2-ctl -d "$dev" --get-ctrl bypass_mode,sensor_mode 2>&1 | tr '\n' ' ')"
   info "${dev} controls: ${c:-unreadable}"
 }
+warn_if_no_step2() {
+  step2_ok_this_boot || warn "Step 2 has not passed in this boot (state file) - results may not mean much. Run ./setup.sh step2"
+}
 do_test() {
+  warn_if_no_step2
   info "${COUNT} frames per port, timeout ${TIMEOUT} s, pass if fps >= ${MIN_FPS} and no new uncorr_err (${RETRIES} retry after a timeout)"
   local p dev attempt n_pass=0 n_fail=0 n_retry=0 results=() first=1
   for p in $PORTS; do
@@ -239,15 +252,17 @@ do_test() {
       fail "${dev}: ${A_REASON}"; n_fail=$((n_fail + 1)); results+=("video${p}=FAIL")
       show_kernel_hints
       show_port_state "$dev"
+      show_link_hint
       if [ "$n_pass" -gt 0 ]; then
         info "Another camera streamed fine in this run, so the driver setup (GMSLMODE, clock, sensor_mode) is OK."
-        info "The problem is specific to this camera's link: the serializer is detected but sends no video."
+        info "The problem is specific to this camera's link: it was detected but sends no video."
         info "Check, in this order: 1) coax connector at both ends  2) camera power / PoC  3) swap this camera with a working one"
         info "(if the fault follows the camera it is the camera; if it stays on the port it is the cable/port)"
+        info "A link that was lost earlier was only restored by powering off the Jetson AND the SG4A board (see README)."
         info "Narrow it down:  ./setup.sh test --ports ${p}   (alone)   |   ./setup.sh test --ports ${p},$(tr ' ' '\n' <<<"$PORTS" | grep -vx "$p" | head -n1)   (this one first)"
       elif [ "$A_NEWERR" -gt 0 ]; then
-        info "uncorr_err usually means a skipped step: GMSLMODE, clock_config.sh or sensor_mode"
-        info "Fix: ./setup.sh step2 --force-reload, then test again"
+        info "uncorr_err with no other camera to compare: either a skipped step (run ./setup.sh step2) or a lost link."
+        info "If step 2 passes and this repeats: power off the Jetson and the SG4A board for 10 s, then step 2 again (see README)"
       elif [ "$A_RC" -eq 124 ]; then
         info "Timeout without uncorr_err: this camera may not be streaming. Narrow it down:"
         info "  ./setup.sh test --ports ${p}      (this camera alone)"
@@ -307,8 +322,9 @@ save_jpg() {   # save_jpg RAW W H JPG
   return 1
 }
 do_check_frame() {
+  warn_if_no_step2
   command -v python3 >/dev/null 2>&1 || die "python3 not found" "sudo apt install python3"
-  local p dev raw jpg rc n_fail=0 results=() ip
+  local p dev raw jpg rc n_fail=0 results=() ip cout crc
   ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
   [ "$DRY_RUN" -eq 1 ] || mkdir -p "$OUTDIR" || die "Cannot create $OUTDIR"
   for p in $PORTS; do
@@ -324,9 +340,15 @@ do_check_frame() {
     info "--- ${dev} (${W}x${H})"
     rm -f "$raw"
     # skip 4 frames (may not be stable yet), keep 1
-    if ! timeout "$TIMEOUT" v4l2-ctl -d "$dev" --set-fmt-video="width=${W},height=${H},pixelformat=UYVY" \
-          --stream-mmap --stream-skip=4 --stream-count=1 --stream-to="$raw" >/dev/null 2>&1; then
-      fail "${dev}: frame capture failed (run './setup.sh test' for details, or './setup.sh stop' if live view is open)"
+    cout="$(timeout "$TIMEOUT" v4l2-ctl -d "$dev" --set-fmt-video="width=${W},height=${H},pixelformat=UYVY" \
+          --stream-mmap --stream-skip=4 --stream-count=1 --stream-to="$raw" 2>&1)"; crc=$?
+    if [ "$crc" -ne 0 ] || [ ! -s "$raw" ]; then
+      if [ "$crc" -eq 124 ]; then fail "${dev}: no frame within ${TIMEOUT} s"
+      else fail "${dev}: frame capture failed (v4l2-ctl exit ${crc})"; fi
+      [ -n "$cout" ] && printf '%s\n' "$cout" | tail -n 3 | sed 's/^/         v4l2-ctl: /'
+      printf '%s\n' "$cout" | grep -qi 'busy' && info "Device busy: close the live view first (./setup.sh stop)"
+      show_kernel_hints; show_link_hint
+      info "If './setup.sh test' passed earlier in this boot, the link may have been lost: power off the Jetson and the SG4A board, see README"
       n_fail=$((n_fail + 1)); results+=("video${p}=capture-failed"); continue
     fi
     analyze_frame "$raw" "$W" "$H"; rc=$?
@@ -376,7 +398,7 @@ find_display() {
   return 1
 }
 LIVE_PIDS=()
-LIVE_LW=0; LIVE_LH=0; LIVE_CHECK=""
+LIVE_LW=0; LIVE_LH=0; LIVE_CHECK=""; SCALER_USED="cpu"
 # best effort: put the windows in a 2-column grid so they do not sit on top of each other (needs xdotool)
 arrange_windows() {
   local p pid wid n=0 x y wins=0
@@ -400,10 +422,34 @@ cleanup_live() {
   printf '\nLive view closed.\n'
   exit 0
 }
+read_fps() {   # read_fps LOGFILE -> F_CUR F_AVG from the last fpsdisplaysink line (empty if none)
+  local line; F_CUR=""; F_AVG=""
+  line="$(grep -E 'current: [0-9.]+' "$1" 2>/dev/null | tail -n1)"
+  [ -n "$line" ] || return 0
+  F_CUR="$(printf '%s' "$line" | grep -oE 'current: [0-9.]+' | tail -n1 | awk '{print $2}')"
+  F_AVG="$(printf '%s' "$line" | grep -oE 'average: [0-9.]+' | tail -n1 | awk '{print $2}')"
+}
+F_CUR=""; F_AVG=""
 do_live() {
-  local e p dev lw lh log pid started=0 i=0 total ubase=0 bad=0 cur
+  local e p dev lw lh log pid started=0 i=0 total ubase=0 bad=0
   # --- step 2: display
   step_begin 2
+  if [ "$DRY_RUN" -eq 0 ] && ! step2_ok_this_boot; then
+    if [ "$FORCE" -eq 1 ]; then warn "Step 2 has not passed in this boot - continuing because of --force"
+    else die "Step 2 has not passed in this boot, so the driver is not set up (no GMSLMODE / clocks / sensor_mode)" "Run ./setup.sh step2 first (or use --force)"; fi
+  fi
+  # scaler: nvvidconv (hardware) when available, else CPU
+  SCALER_USED="$SCALER"
+  if [ "$SCALER" != cpu ] && [ "$DRY_RUN" -eq 0 ] && ! gst-inspect-1.0 nvvidconv >/dev/null 2>&1; then
+    if [ "$SCALER" = nvvidconv ]; then
+      die "GStreamer element nvvidconv not found" "sudo apt install nvidia-l4t-gstreamer   (then: rm -f ~/.cache/gstreamer-1.0/registry*.bin). Do NOT run apt upgrade on nvidia-l4t-* packages"
+    fi
+    SCALER_USED="cpu"
+    warn "nvvidconv not installed: using CPU scaling (measured ~6 fps per camera, too slow). Install: sudo apt install nvidia-l4t-gstreamer"
+  elif [ "$SCALER" = auto ]; then
+    SCALER_USED="nvvidconv"
+  fi
+  info "Scaler: ${SCALER_USED}"
   if ! command -v gst-launch-1.0 >/dev/null 2>&1; then
     [ "$DRY_RUN" -eq 1 ] || die "gst-launch-1.0 not found" "sudo apt install gstreamer1.0-tools"
     warn "gst-launch-1.0 not found (dry run: continuing)"
@@ -440,7 +486,7 @@ do_live() {
     LIVE_LW="$lw"; LIVE_LH="$lh"
     local gst=(gst-launch-1.0 -v v4l2src "device=${dev}" !
                "video/x-raw,format=UYVY,width=${W},height=${H},framerate=${FPS}/1")
-    if [ "$SCALER" = nvvidconv ]; then   # hardware scaler: much less CPU with 4 cameras (not yet tested on the target)
+    if [ "$SCALER_USED" = nvvidconv ]; then   # hardware scaler (measured on this Jetson: ~30 fps per camera with 2 cameras)
       gst+=(! nvvidconv ! "video/x-raw,format=I420,width=${lw},height=${lh}")
     else
       gst+=(! videoscale ! "video/x-raw,width=${lw},height=${lh}" ! videoconvert)
@@ -471,27 +517,36 @@ do_live() {
   sleep 6
   arrange_windows
   sleep 2
-  local results=() slow=0
+  local results=() slow=0 shown
   for p in $LIVE_CHECK; do
     log="/tmp/sg4a_live_cam${p}.log"; [ -f "$log" ] || continue
     pid="$(pgrep -f "v4l2src device=/dev/video${p} " | head -n1)"
-    cur="$(grep -oE 'current: [0-9.]+' "$log" | tail -n1 | awk '{print $2}')"
+    read_fps "$log"
+    # average still ramping up but the current rate is fine: wait once more and re-read
+    if [ -n "$pid" ] && [ -n "$F_AVG" ] && awk -v a="$F_AVG" -v c="${F_CUR:-0}" -v b="$MIN_FPS" 'BEGIN{exit !(a<b && c>=b)}'; then
+      sleep 6; read_fps "$log"
+    fi
+    shown="${F_AVG:-${F_CUR:-}}"
     if [ -z "$pid" ]; then
       fail "/dev/video${p}: process exited - last lines:"; tail -n 5 "$log" | sed 's/^/         /'; bad=1; results+=("video${p}=exited")
-    elif [ -z "$cur" ] || awk -v a="$cur" 'BEGIN{exit !(a+0<=0)}'; then
-      fail "/dev/video${p}: running but NO frames (fps ${cur:-n/a}) - the window will stay black or empty"
-      info "This is the same fault as a failed capture test on this port: ./setup.sh test --ports ${p}"
+    elif [ -z "$shown" ] || awk -v a="$shown" 'BEGIN{exit !(a+0<=0)}'; then
+      fail "/dev/video${p}: running but NO frames (fps ${shown:-n/a}) - the window will stay black or empty"
+      info "Same fault as a failed capture test on this port: ./setup.sh test --ports ${p}"
+      show_link_hint
       bad=1; results+=("video${p}=no-frames")
-    elif awk -v a="$cur" -v b="$MIN_FPS" 'BEGIN{exit !(a<b)}'; then
-      warn "/dev/video${p}: ${cur} fps is below ${MIN_FPS}"; slow=1; bad=1; results+=("video${p}=${cur}fps(low)")
+    elif awk -v a="$shown" -v b="$MIN_FPS" 'BEGIN{exit !(a<b)}'; then
+      warn "/dev/video${p}: average ${F_AVG:-n/a} fps (now ${F_CUR:-n/a}) is below ${MIN_FPS}"; slow=1; bad=1; results+=("video${p}=${shown}fps(low)")
     else
-      ok "/dev/video${p}: ${cur} fps"; results+=("video${p}=${cur}fps")
+      ok "/dev/video${p}: average ${F_AVG:-n/a} fps (now ${F_CUR:-n/a})"; results+=("video${p}=${shown}fps")
     fi
   done
   if [ "$slow" -eq 1 ]; then
-    info "Low fps: the Jetson CPU is probably too busy scaling ${total} streams for display."
-    if [ "$SCALER" = cpu ]; then info "Try: ./setup.sh live --scaler nvvidconv   (hardware scaler), or a smaller window: --live-size 480x384"
-    else info "Try a smaller window: --live-size 480x384 ; check load with: tegrastats"; fi
+    if [ "$SCALER_USED" = cpu ]; then
+      info "Low fps with CPU scaling: measured ~6 fps per camera on this Jetson, the camera itself delivers 30."
+      info "Install the hardware scaler: sudo apt install nvidia-l4t-gstreamer   (then ./setup.sh live)"
+    else
+      info "Low fps with nvvidconv: try a smaller window (--live-size 480x384) and watch the load with: tegrastats"
+    fi
   fi
   if [ "$(uncorr_count)" -gt "$ubase" ]; then warn "New uncorr_err in dmesg since live view started - a camera may not be receiving frames"; bad=1; fi
   if [ "$bad" -eq 1 ]; then

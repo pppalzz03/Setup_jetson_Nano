@@ -238,6 +238,19 @@ detected_ports_from() {
   dmesg_last_load_from "$1" | grep -E 'port [0-9]+ camera.*been detected' | grep -oE 'port [0-9]+' \
     | awk '{print $2}' | sort -un | tr '\n' ' ' | sed 's/ $//'
 }
+# "port0=0x16 port1=0x00 ..." from the dser_link_check lines of the last driver load.
+# Observed on this hardware: 0xc8 = camera detected and streaming; 0x00 = nothing linked;
+# other values (0x02/0x12/0x16) = no usable link. The meaning of the register is not documented here.
+link_values_from() {
+  dmesg_last_load_from "$1" | awk '
+    /dser_link_check Der-[0-9]+ link port/ { if (match($0, /port [0-9]+/)) port = substr($0, RSTART + 5, RLENGTH - 5) }
+    /dser_link_check link:/ { if (match($0, /link:0x[0-9a-fA-F]+/)) printf "port%s=%s ", port, substr($0, RSTART + 5, RLENGTH - 5) }
+  ' | sed 's/ $//'
+}
+# 0 if step 2 finished (DONE/WARN) during the current boot
+step2_ok_this_boot() {
+  case "$(state_field step2 2)" in DONE|WARN) [ "$(state_field step2 4)" = "$SG4A_BOOT_ID" ] ;; *) return 1 ;; esac
+}
 uncorr_count() { dmesg_all | grep -c 'uncorr_err' || true; }
 
 # sensor_mode -> "W H"

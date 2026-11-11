@@ -6,6 +6,7 @@
 #   ./setup.sh status        overall checklist and progress
 #   ./setup.sh step1|step2|step3 [options]   run one step (options are passed through)
 #   ./setup.sh test|check-frame|formats|live|stop [options]   camera test commands
+#   ./setup.sh diag-link [--rounds N]   find which action makes the camera link disappear
 #   ./setup.sh persist [inspect|enable-modprobe|enable-service|status|revert]   optional, untested
 #   ./setup.sh reset         forget the recorded progress (does not change the system)
 #   Add --dry-run to any command to print what would be done.
@@ -20,6 +21,7 @@ S1="${SG4A_SCRIPTS_DIR}/step1_before_reboot.sh"
 S2="${SG4A_SCRIPTS_DIR}/step2_after_reboot.sh"
 S2B="${SG4A_SCRIPTS_DIR}/step2b_persist.sh"
 S3="${SG4A_SCRIPTS_DIR}/step3_test_camera.sh"
+SDL="${SG4A_SCRIPTS_DIR}/diag_link.sh"
 
 usage() {
   cat <<EOF
@@ -33,6 +35,7 @@ Usage: ./setup.sh [command] [options]
   test | check-frame | formats   run one camera test
   live [opts]      live view on the Jetson monitor (over SSH is fine)
   stop             stop the live view
+  diag-link [opts] find which action makes the camera link disappear (run after a full power cycle + step2)
   persist [cmd]    optional: keep GMSLMODE after reboot (untested) - inspect|enable-modprobe|enable-service|status|revert
   reset            forget recorded progress (state file only)
 
@@ -136,6 +139,7 @@ case "$CMD" in
   step3|test-all) shift; exec bash "$S3" all "$@" ;;
   test|check-frame|formats|live|stop) shift; exec bash "$S3" "$CMD" "$@" ;;
   persist)        shift; exec bash "$S2B" "$@" ;;
+  diag-link)      shift; exec bash "$SDL" "$@" ;;
   reset)
     if confirm "Forget recorded progress in ${SG4A_STATE_FILE}? (the system is not changed)"; then
       rm -f "$SG4A_STATE_FILE" && ok "Progress reset"

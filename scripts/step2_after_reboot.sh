@@ -115,7 +115,11 @@ if command -v i2cdetect >/dev/null 2>&1; then
 fi
 case "$I2C_ACK" in
   bound) ok "MAX96712 answers at 0x6b and a driver is bound (UU)" ;;
-  free)  ok "MAX96712 answers at 0x6b (no driver bound yet) - the hardware path on i2c-9 is alive" ;;
+  free)  ok "MAX96712 answers at 0x6b (no driver bound yet) - the hardware path on i2c-9 is alive"
+         if lsmod | awk '{print $1}' | grep -qx "$MOD_DER" && [ "$RELOAD_DER" -eq 0 ]; then
+           warn "${MOD_DER} is loaded but no driver is bound to the chip (6b, not UU) - it will be reloaded in step 2"
+           RELOAD_DER=1
+         fi ;;
   none)  warn "Nothing answers at 0x6b on i2c-9 (shows --)" ;;
   *)     info "Could not read i2c-9 (i2cdetect missing?)" ;;
 esac
@@ -233,6 +237,7 @@ if [ -n "$PORTS" ]; then
   ok "Cameras detected on port(s): ${PORTS}"
   printf '%s\n' "$SECTION" | grep 'been detected' | sed 's/^/         /'
   [ "$N_DET_ERR" -gt 0 ] && info "Ports without a camera show \"detect error\" (${N_DET_ERR} lines) - this is normal"
+  LINKS="$(link_values_from "$DM")"; [ -n "$LINKS" ] && info "Link values: ${LINKS}   (0xc8 = camera linked)"
 elif [ "$DRY_RUN" -eq 1 ]; then
   info "(dry run: no \"been detected!\" in dmesg yet)"
 else
@@ -248,8 +253,12 @@ else
     die "\"detect error\" on every port and GMSLMODE=${GOT_MODE} (0 = first-generation GMSL)" \
         "Wrong serializer type: the cameras are GMSL2. Run: ./setup.sh step2 --gmsl 2,2,2,2  (or 1 for GMSL2/6G)"
   else
+    LINKS="$(link_values_from "$DM")"
+    [ -n "$LINKS" ] && info "Link values seen by the driver: ${LINKS}   (0xc8 = camera linked; 0x00 = nothing linked)"
+    info "The driver and the MAX96712 are fine; the cameras are not linking. On this hardware a lost link was only"
+    info "restored by a FULL power cycle (reloading drivers or rebooting only the Jetson did not help)."
     die "\"detect error\" on every port (${N_DET_ERR} lines) although GMSLMODE=${GOT_MODE}" \
-        "Check 12V power to the board, GMSL coax cables, PoC support and GMSL type (try --gmsl 1,1,1,1)"
+        "Power off the Jetson AND the SG4A board (unplug 12V, wait 10 s), check the coax connectors at both ends, power on, run ./setup.sh step2 again. Only if that never helps, try --gmsl 1,1,1,1"
   fi
 fi
 if [ -n "$PORTS_OPT" ]; then PORTS="${PORTS_OPT//,/ }"; info "Using ports from --ports: ${PORTS}"; fi
