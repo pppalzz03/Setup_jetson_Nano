@@ -33,6 +33,8 @@ DISPLAY_OPT=""
 XAUTH_OPT=""
 LIVE_SIZE=""
 DETACH=0
+SCALER="cpu"
+EXPECT=4
 TIMEOUT=15
 RETRIES=1
 SETTLE=2
@@ -57,6 +59,8 @@ Options:
   --display :N       X display to use (default: auto-detect)
   --xauth FILE       XAUTHORITY file (default: auto-detect)
   --live-size WxH    live window size (default: half the capture size)
+  --scaler cpu|nvvidconv  live: how frames are scaled for the window (default: ${SCALER}; try nvvidconv if fps is low with 4 cameras)
+  --expect N         number of cameras you expect (default: ${EXPECT}); only used to report missing ports
   --detach           live: keep running after SSH closes (stop with: $0 stop)
   --dry-run          print commands, do not run them
 EOF
@@ -82,6 +86,8 @@ while [ $# -gt 0 ]; do
     --display)   [ $# -ge 2 ] || bad_arg "$1"; DISPLAY_OPT="$2"; shift 2 ;;
     --xauth)     [ $# -ge 2 ] || bad_arg "$1"; XAUTH_OPT="$2"; shift 2 ;;
     --live-size) [ $# -ge 2 ] || bad_arg "$1"; LIVE_SIZE="$2"; shift 2 ;;
+    --scaler)    [ $# -ge 2 ] || bad_arg "$1"; SCALER="$2"; shift 2 ;;
+    --expect)    [ $# -ge 2 ] || bad_arg "$1"; EXPECT="$2"; shift 2 ;;
     --detach)    DETACH=1; shift ;;
     --dry-run)   DRY_RUN=1; shift ;;
     -h|--help)   usage; exit 0 ;;
@@ -96,6 +102,8 @@ done
 { [[ "$TIMEOUT" =~ ^[0-9]+$ ]] && [ "$TIMEOUT" -gt 0 ]; } || bad_arg "--timeout $TIMEOUT"
 [[ "$RETRIES" =~ ^[0-9]+$ ]] || bad_arg "--retries $RETRIES"
 [[ "$SETTLE" =~ ^[0-9]+$ ]] || bad_arg "--settle $SETTLE"
+[[ "$SCALER" =~ ^(cpu|nvvidconv)$ ]] || bad_arg "--scaler $SCALER (cpu|nvvidconv)"
+{ [[ "$EXPECT" =~ ^[0-9]+$ ]] && [ "$EXPECT" -le 4 ]; } || bad_arg "--expect $EXPECT (0-4)"
 [ -z "$LIVE_SIZE" ] || [[ "$LIVE_SIZE" =~ ^[0-9]+x[0-9]+$ ]] || bad_arg "--live-size $LIVE_SIZE (e.g. 960x768)"
 [ -z "$DISPLAY_OPT" ] || [[ "$DISPLAY_OPT" =~ ^:[0-9]+(\.[0-9]+)?$ ]] || bad_arg "--display $DISPLAY_OPT (e.g. :1)"
 
@@ -106,6 +114,13 @@ detect_ports() {
   PORTS="$(detected_ports_from "$(dmesg_all)")"
   if [ -n "$PORTS" ]; then
     ok "Cameras detected (dmesg): port(s) ${PORTS}"
+    local n_det missing="" q
+    n_det=$(wc -w <<<"$PORTS")
+    if [ "$n_det" -lt "$EXPECT" ]; then
+      for q in $(seq 0 $((EXPECT - 1))); do grep -qw "$q" <<<"$PORTS" || missing="${missing}${missing:+ }${q}"; done
+      warn "Only ${n_det} of ${EXPECT} expected cameras detected - missing port(s): ${missing}"
+      info "Missing cameras are not tested or shown. Check their power/coax, then: ./setup.sh step2 --force-reload"
+    fi
   elif [ "$DRY_RUN" -eq 1 ]; then
     warn "No \"been detected!\" in dmesg (dry run: assuming port 0)"; PORTS="0"
   else
@@ -186,6 +201,11 @@ show_kernel_hints() {   # recent camera-related kernel messages, to diagnose a f
   if [ -n "$lines" ]; then info "Recent kernel messages:"; printf '%s\n' "$lines" | sed 's/^/           /'
   else info "No related kernel messages (no uncorr_err): the stream started but no frame arrived"; fi
 }
+show_port_state() {   # controls that decide whether the sensor streams
+  local dev="$1" c
+  c="$(v4l2-ctl -d "$dev" --get-ctrl bypass_mode,sensor_mode 2>&1 | tr '\n' ' ')"
+  info "${dev} controls: ${c:-unreadable}"
+}
 do_test() {
   info "${COUNT} frames per port, timeout ${TIMEOUT} s, pass if fps >= ${MIN_FPS} and no new uncorr_err (${RETRIES} retry after a timeout)"
   local p dev attempt n_pass=0 n_fail=0 n_retry=0 results=() first=1
@@ -218,7 +238,14 @@ do_test() {
     else
       fail "${dev}: ${A_REASON}"; n_fail=$((n_fail + 1)); results+=("video${p}=FAIL")
       show_kernel_hints
-      if [ "$A_NEWERR" -gt 0 ]; then
+      show_port_state "$dev"
+      if [ "$n_pass" -gt 0 ]; then
+        info "Another camera streamed fine in this run, so the driver setup (GMSLMODE, clock, sensor_mode) is OK."
+        info "The problem is specific to this camera's link: the serializer is detected but sends no video."
+        info "Check, in this order: 1) coax connector at both ends  2) camera power / PoC  3) swap this camera with a working one"
+        info "(if the fault follows the camera it is the camera; if it stays on the port it is the cable/port)"
+        info "Narrow it down:  ./setup.sh test --ports ${p}   (alone)   |   ./setup.sh test --ports ${p},$(tr ' ' '\n' <<<"$PORTS" | grep -vx "$p" | head -n1)   (this one first)"
+      elif [ "$A_NEWERR" -gt 0 ]; then
         info "uncorr_err usually means a skipped step: GMSLMODE, clock_config.sh or sensor_mode"
         info "Fix: ./setup.sh step2 --force-reload, then test again"
       elif [ "$A_RC" -eq 124 ]; then
@@ -349,6 +376,24 @@ find_display() {
   return 1
 }
 LIVE_PIDS=()
+LIVE_LW=0; LIVE_LH=0; LIVE_CHECK=""
+# best effort: put the windows in a 2-column grid so they do not sit on top of each other (needs xdotool)
+arrange_windows() {
+  local p pid wid n=0 x y wins=0
+  if ! command -v xdotool >/dev/null 2>&1; then
+    info "Windows may overlap. To tile them automatically: sudo apt install xdotool  (or drag them apart)"; return 0
+  fi
+  for p in $LIVE_CHECK; do
+    pid="$(pgrep -f "v4l2src device=/dev/video${p} " | head -n1)"; [ -n "$pid" ] || continue
+    wid="$(DISPLAY="$LIVE_DISPLAY" XAUTHORITY="$LIVE_XAUTH" xdotool search --pid "$pid" 2>/dev/null | tail -n1)"
+    if [ -n "$wid" ]; then
+      x=$(( (n % 2) * (LIVE_LW + 10) )); y=$(( (n / 2) * (LIVE_LH + 40) ))
+      DISPLAY="$LIVE_DISPLAY" XAUTHORITY="$LIVE_XAUTH" xdotool windowmove "$wid" "$x" "$y" 2>/dev/null && wins=$((wins + 1))
+    fi
+    n=$((n + 1))
+  done
+  info "Arranged ${wins} window(s) in a grid"
+}
 # shellcheck disable=SC2329  # called via trap
 cleanup_live() {
   [ ${#LIVE_PIDS[@]} -gt 0 ] && kill "${LIVE_PIDS[@]}" 2>/dev/null
@@ -385,13 +430,22 @@ do_live() {
   for p in $PORTS; do
     i=$((i + 1)); dev="/dev/video${p}"; log="/tmp/sg4a_live_cam${p}.log"
     need_dev "$dev" || continue
-    if pgrep -f "v4l2src device=${dev} " >/dev/null 2>&1; then ok "${dev}: live view already running, skipped"; continue; fi
+    if pgrep -f "v4l2src device=${dev} " >/dev/null 2>&1; then ok "${dev}: live view already running, skipped"; LIVE_CHECK="${LIVE_CHECK} ${p}"; continue; fi
     resolve_res "$dev" || continue
-    if [ -n "$LIVE_SIZE" ]; then lw="${LIVE_SIZE%x*}"; lh="${LIVE_SIZE#*x}"; else lw=$((W / 2)); lh=$((H / 2)); fi
+    [ "$DRY_RUN" -eq 1 ] || rm -f "$log"   # never read a log left by an earlier run
+    LIVE_CHECK="${LIVE_CHECK} ${p}"
+    if [ -n "$LIVE_SIZE" ]; then lw="${LIVE_SIZE%x*}"; lh="${LIVE_SIZE#*x}"
+    elif [ "$total" -gt 2 ]; then lw=$((W / 3)); lh=$((H / 3))   # 3-4 cameras: smaller windows so they tile on one screen
+    else lw=$((W / 2)); lh=$((H / 2)); fi
+    LIVE_LW="$lw"; LIVE_LH="$lh"
     local gst=(gst-launch-1.0 -v v4l2src "device=${dev}" !
-               "video/x-raw,format=UYVY,width=${W},height=${H},framerate=${FPS}/1" !
-               videoscale ! "video/x-raw,width=${lw},height=${lh}" ! videoconvert !
-               fpsdisplaysink video-sink=xvimagesink text-overlay=true sync=false)
+               "video/x-raw,format=UYVY,width=${W},height=${H},framerate=${FPS}/1")
+    if [ "$SCALER" = nvvidconv ]; then   # hardware scaler: much less CPU with 4 cameras (not yet tested on the target)
+      gst+=(! nvvidconv ! "video/x-raw,format=I420,width=${lw},height=${lh}")
+    else
+      gst+=(! videoscale ! "video/x-raw,width=${lw},height=${lh}" ! videoconvert)
+    fi
+    gst+=(! fpsdisplaysink video-sink=xvimagesink text-overlay=true sync=false)
     if [ "$DRY_RUN" -eq 1 ]; then
       printf '  [dry-run] DISPLAY=%s XAUTHORITY=%s %s > %s 2>&1 &\n' "$LIVE_DISPLAY" "$LIVE_XAUTH" "$(printf '%q ' "${gst[@]}")" "$log"
     else
@@ -413,19 +467,35 @@ do_live() {
   # --- step 4: verify
   step_begin 4
   if [ "$DRY_RUN" -eq 1 ]; then step_done "dry run"; sg_finish DONE "dry run"; return 0; fi
-  info "Waiting 6 s, then checking each stream..."
+  info "Waiting 6 s, then checking each stream (target: > $((${MIN_FPS%.*} - 1)) fps per camera)..."
   sleep 6
-  local results=()
-  for p in $PORTS; do
+  arrange_windows
+  sleep 2
+  local results=() slow=0
+  for p in $LIVE_CHECK; do
     log="/tmp/sg4a_live_cam${p}.log"; [ -f "$log" ] || continue
     pid="$(pgrep -f "v4l2src device=/dev/video${p} " | head -n1)"
     cur="$(grep -oE 'current: [0-9.]+' "$log" | tail -n1 | awk '{print $2}')"
-    if [ -n "$pid" ]; then ok "/dev/video${p}: running, latest fps ${cur:-n/a}"; results+=("video${p}=${cur:-?}fps")
-    else fail "/dev/video${p}: process exited - last lines:"; tail -n 5 "$log" | sed 's/^/         /'; bad=1; results+=("video${p}=exited"); fi
+    if [ -z "$pid" ]; then
+      fail "/dev/video${p}: process exited - last lines:"; tail -n 5 "$log" | sed 's/^/         /'; bad=1; results+=("video${p}=exited")
+    elif [ -z "$cur" ] || awk -v a="$cur" 'BEGIN{exit !(a+0<=0)}'; then
+      fail "/dev/video${p}: running but NO frames (fps ${cur:-n/a}) - the window will stay black or empty"
+      info "This is the same fault as a failed capture test on this port: ./setup.sh test --ports ${p}"
+      bad=1; results+=("video${p}=no-frames")
+    elif awk -v a="$cur" -v b="$MIN_FPS" 'BEGIN{exit !(a<b)}'; then
+      warn "/dev/video${p}: ${cur} fps is below ${MIN_FPS}"; slow=1; bad=1; results+=("video${p}=${cur}fps(low)")
+    else
+      ok "/dev/video${p}: ${cur} fps"; results+=("video${p}=${cur}fps")
+    fi
   done
+  if [ "$slow" -eq 1 ]; then
+    info "Low fps: the Jetson CPU is probably too busy scaling ${total} streams for display."
+    if [ "$SCALER" = cpu ]; then info "Try: ./setup.sh live --scaler nvvidconv   (hardware scaler), or a smaller window: --live-size 480x384"
+    else info "Try a smaller window: --live-size 480x384 ; check load with: tegrastats"; fi
+  fi
   if [ "$(uncorr_count)" -gt "$ubase" ]; then warn "New uncorr_err in dmesg since live view started - a camera may not be receiving frames"; bad=1; fi
   if [ "$bad" -eq 1 ]; then
-    info "If not all windows show video: ./setup.sh stop, then start live again"
+    info "If a window is missing: ./setup.sh stop, then start live again (cameras are started 2 s apart)"
     step_warn "${results[*]}"; sg_finish WARN "${results[*]}"
   else
     step_done "${results[*]}"; sg_finish DONE "${results[*]}"
