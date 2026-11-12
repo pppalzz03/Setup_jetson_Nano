@@ -236,7 +236,12 @@ must close their GMSL pipelines while it exists and reopen them after it is remo
 `GMSLCameraDriver` does this). The watcher never kills processes: if `/dev/video*` is still in use
 after 20 s it aborts, removes the file and retries later (up to 3 times, 15 s apart).
 
+**Tested on the SG4A / Orin Nano board** (cameras moved between ports 0-3 while the watcher ran): a link
+loss is detected within 1 s, and 3 s after the lock is stable the cameras are released, step 2 reloads the
+driver (~5 s) and the application reopens them. A locked link does not prove the camera streams: port 1
+once showed lock (0xc8) but delivered 0 frames and `uncorr_err` every 2.5 s; check with `./setup.sh test --ports N`.
+If a link is lost for unknown reasons only a full power cycle of the Jetson and the SG4A board restores it.
+
 **Limits.** All GMSL cameras are released together (the driver probe rewrites link settings for
-every port, so per-port reconnect is not possible). Whether a reload fully restores a replugged
-camera must be confirmed on the hardware; a link lost for unknown reasons may still need a full
-power cycle of the Jetson and the SG4A board.
+every port, so per-port reconnect is not possible), so every camera pauses for ~5 s during a reload.
+The recovery only checks that the lock and /dev/videoN come back, not that frames flow.
