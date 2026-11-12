@@ -202,3 +202,41 @@ Tested with `bash -n`, `shellcheck` (clean) and a mock Jetson (stubbed dmesg / l
 5. the new automatic `max96712` reload when the chip shows `6b` (tested only with stubs)
 6. the DMSBBFAN model, the cause of a solid-green frame, sensor modes other than 1, and a combined single-window view
 7. window tiling with `xdotool` (only a stub was tested)
+
+## Hot-plug reconnect (GMSL2)
+
+Unplugging a coax cable powers the camera off (PoC). The GMSL2 link relocks by itself when it is
+plugged back in, but the serializer/sensor configuration done at driver probe is lost, so video
+stays frozen until the camera driver (`sgx_yuv_gmsl2`) is reloaded. `scripts/hotplug_watch.py`
+automates this: it polls the MAX96712 lock bits (read-only I2C reads), and after a link change that
+has been stable for a few seconds it releases the cameras, runs `step2 --force-reload`, verifies
+`/dev/videoN` and lets the application reopen them.
+
+**1. Verify the register map on your board first** (values below are from the SG4A/Orin Nano setup:
+I2C bus 9, address 0x6b, lock regs port0..3 = 0x1a, 0x0a, 0x0b, 0x0c, bit 0x08):
+
+    ./setup.sh hotplug once        # run while plugging / unplugging each camera; the "lock" column must follow
+
+Another board (Orin NX, Nano 4-camera, other carrier) may differ: use `--bus`, `--addr`,
+`--lock-regs 0:0x1a,1:0x0a,2:0x0b,3:0x0c` and `--lock-mask`.
+
+**2. Monitor mode (default, changes nothing)**:
+
+    ./setup.sh hotplug watch       # logs LOST / LOCKED events and what recovery would do
+
+**3. Enable recovery** once the events match reality:
+
+    ./setup.sh hotplug watch --enable-recovery        # foreground test
+    ./setup.sh hotplug install --enable-recovery      # systemd service (sg4a-hotplug), starts at boot
+    ./setup.sh hotplug status | uninstall
+
+**Coordination protocol.** The watcher creates the signal file `/run/sg4a/camera-reload`
+(override: env `SG4A_HOTPLUG_FLAG`) containing JSON `{ports, reason, pid, started}`. Applications
+must close their GMSL pipelines while it exists and reopen them after it is removed (BlackBox's
+`GMSLCameraDriver` does this). The watcher never kills processes: if `/dev/video*` is still in use
+after 20 s it aborts, removes the file and retries later (up to 3 times, 15 s apart).
+
+**Limits.** All GMSL cameras are released together (the driver probe rewrites link settings for
+every port, so per-port reconnect is not possible). Whether a reload fully restores a replugged
+camera must be confirmed on the hardware; a link lost for unknown reasons may still need a full
+power cycle of the Jetson and the SG4A board.
